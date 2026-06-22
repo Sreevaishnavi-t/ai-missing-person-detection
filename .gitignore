@@ -1,0 +1,24 @@
+# Ignore python cache files and environments
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/venv/
+**/.venv/
+.env
+.env.*
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore Phase walkthroughs
+walkthrough.md
+**/walkthrough.md
+
+# Ignore generated test files and user data
+**/data/screenshots/*
+!**/data/screenshots/.gitkeep
+**/data/db/*
+!**/data/db/.gitkeep
+**/data/watchlist/*
+!**/data/watchlist/.gitkeep
