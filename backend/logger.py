@@ -43,6 +43,7 @@ class Match(Base):
     timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     screenshot_path = Column(String, nullable=False)
     video_source = Column(String, nullable=False)
+    status = Column(String, default="pending", nullable=False)
 
     def to_dict(self) -> dict:
         """
@@ -55,7 +56,8 @@ class Match(Base):
             "confidence": self.confidence,
             "timestamp": self.timestamp.isoformat() + "Z", # Append Z to indicate UTC
             "screenshot_path": self.screenshot_path,
-            "video_source": self.video_source
+            "video_source": self.video_source,
+            "status": self.status
         }
 
 # Configure SQLite database connection engine.
@@ -74,7 +76,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
 
-def log_match(person_name: str, confidence: float, screenshot_path: str, video_source: str) -> Match:
+def log_match(person_name: str, confidence: float, screenshot_path: str, video_source: str, status: str = "pending") -> Match:
     """
     Inserts a verified face recognition detection event log into the SQLite database.
     
@@ -93,7 +95,8 @@ def log_match(person_name: str, confidence: float, screenshot_path: str, video_s
             person_name=person_name,
             confidence=confidence,
             screenshot_path=str(screenshot_path),
-            video_source=str(video_source)
+            video_source=str(video_source),
+            status=status
         )
         session.add(new_match)
         session.commit()
@@ -126,5 +129,50 @@ def get_recent_matches(limit: int = 50) -> list:
             .all()
         )
         return [match.to_dict() for match in results]
+    finally:
+        session.close()
+
+
+def delete_all_matches() -> int:
+    """
+    Deletes every row from the matches table.
+
+    Returns:
+        int: Number of rows deleted.
+    """
+    session = SessionLocal()
+    try:
+        count = session.query(Match).delete()
+        session.commit()
+        return count
+    except Exception as exc:
+        session.rollback()
+        raise exc
+    finally:
+        session.close()
+
+def update_match_status(match_id: int, status: str) -> dict | None:
+    """
+    Updates the status of a specific match.
+    
+    Args:
+        match_id (int): ID of the match.
+        status (str): New status ('pending', 'approved', 'rejected').
+        
+    Returns:
+        dict: The updated match as a dict, or None if not found.
+    """
+    session = SessionLocal()
+    try:
+        match = session.query(Match).filter(Match.id == match_id).first()
+        if not match:
+            return None
+        match.status = status
+        session.commit()
+        session.refresh(match)
+        return match.to_dict()
+    except Exception as exc:
+        session.rollback()
+        raise exc
     finally:
         session.close()

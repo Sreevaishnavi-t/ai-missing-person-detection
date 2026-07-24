@@ -22,3 +22,11 @@ walkthrough.md
 !**/data/db/.gitkeep
 **/data/watchlist/*
 !**/data/watchlist/.gitkeep
+
+# IDE and Editor files
+.vscode/
+.idea/
+
+# Temporary files & log outputs
+matches*.txt
+
