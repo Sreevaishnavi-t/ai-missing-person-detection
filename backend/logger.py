@@ -41,7 +41,7 @@ class Match(Base):
     person_name = Column(String, nullable=False)
     confidence = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    screenshot_path = Column(String, nullable=False)
+    screenshot_path = Column(String, nullable=True)
     video_source = Column(String, nullable=False)
     status = Column(String, default="pending", nullable=False)
 
@@ -76,15 +76,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
 
-def log_match(person_name: str, confidence: float, screenshot_path: str, video_source: str, status: str = "pending") -> Match:
+def log_match(person_name: str, confidence: float, screenshot_path: str | None = None, video_source: str = "0", status: str = "pending") -> Match:
     """
     Inserts a verified face recognition detection event log into the SQLite database.
     
     Args:
         person_name (str): The name/identity of the detected missing person.
         confidence (float): The similarity/confidence score (0.0 to 1.0).
-        screenshot_path (str): File path where the frame snapshot is saved on disk.
+        screenshot_path (str, optional): File path where the frame snapshot is saved on disk.
         video_source (str): Identifier of the stream source (e.g., '0' for webcam, or video filename).
+        status (str): Match approval status ('pending', 'approved', 'rejected').
         
     Returns:
         Match: The created database Match model instance.
@@ -94,7 +95,7 @@ def log_match(person_name: str, confidence: float, screenshot_path: str, video_s
         new_match = Match(
             person_name=person_name,
             confidence=confidence,
-            screenshot_path=str(screenshot_path),
+            screenshot_path=str(screenshot_path) if screenshot_path is not None else None,
             video_source=str(video_source),
             status=status
         )

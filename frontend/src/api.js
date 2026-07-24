@@ -24,11 +24,17 @@ export async function enrollPerson(fd) {
   return data
 }
 
-export async function startDetection(source = 0, stopOnMatch = false) {
+export async function startDetection(source = 0, stopOnMatch = false, confidenceThreshold = 0.45, detectEveryN = 3, autoScreenshot = true) {
   const res = await fetch(`${BASE_URL}/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source, stop_on_match: stopOnMatch }),
+    body: JSON.stringify({
+      source,
+      stop_on_match: stopOnMatch,
+      confidence_threshold: confidenceThreshold,
+      detect_every_n: detectEveryN,
+      auto_screenshot: autoScreenshot
+    }),
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail ?? `Start failed (${res.status})`)
@@ -64,3 +70,28 @@ export async function updateMatchStatus(id, status) {
   if (!res.ok) throw new Error(data.detail ?? `Update failed (${res.status})`)
   return data
 }
+
+export async function clearAllMatches() {
+  const res = await fetch(`${BASE_URL}/results/all`, { method: 'DELETE' })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail ?? `Clear failed (${res.status})`)
+  return data
+}
+
+export async function rebuildIndex() {
+  const res = await fetch(`${BASE_URL}/rebuild-index`, { method: 'POST' })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail ?? `Rebuild failed (${res.status})`)
+  return data
+}
+
+export async function addPersonPhoto(id, fd) {
+  const res = await fetch(`${BASE_URL}/watchlist/${id}/photos`, {
+    method: 'POST',
+    body: fd,
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail ?? `Adding photo failed (${res.status})`)
+  return data
+}
+

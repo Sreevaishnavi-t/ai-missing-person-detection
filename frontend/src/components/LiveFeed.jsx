@@ -2,7 +2,15 @@ import { useState, useEffect } from 'react'
 import { startDetection, stopDetection, fetchStatus } from '../api'
 import { BASE_URL } from '../api'
 
-export default function LiveFeed({ isRunning, onRunningChange, source = 0, showToast }) {
+export default function LiveFeed({
+  isRunning,
+  onRunningChange,
+  source = 0,
+  showToast,
+  threshold = 0.45,
+  skipFrames = 3,
+  autoShot = true
+}) {
   const [loading,   setLoading]   = useState(false)
   const [streamKey, setStreamKey] = useState(() => Date.now())
   const [stopOnMatch, setStopOnMatch] = useState(true)
@@ -26,7 +34,7 @@ export default function LiveFeed({ isRunning, onRunningChange, source = 0, showT
   async function handleStart() {
     setLoading(true)
     try {
-      await startDetection(source, stopOnMatch)
+      await startDetection(source, stopOnMatch, threshold, skipFrames, autoShot)
       onRunningChange(true)
       setStreamKey(Date.now())
     } catch (err) {
@@ -113,7 +121,7 @@ export default function LiveFeed({ isRunning, onRunningChange, source = 0, showT
               </svg>
             ) : (
               <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 00008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 0 0 8 8v4a1 1 0 0 0 1.555.832l3-2a1 1 0 0 0 0-1.664l-3-2z" clipRule="evenodd" />
               </svg>
             )}
             {loading && !isRunning ? 'Starting…' : 'Start Detection'}

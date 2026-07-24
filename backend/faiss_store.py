@@ -107,15 +107,7 @@ class FAISSStore:
         # - I: array of shape (1, actual_k) containing the corresponding FAISS indices
         D, I = self.index.search(emb, actual_k)
         
-        results = []
-        for score, idx in zip(D[0], I[0]):
-            # FAISS returns -1 index if it cannot fill the top_k slots
-            if idx == -1:
-                continue
-            name = self.names[idx]
-            results.append((name, float(score))[-1]) # Just maps to correct name and score
-            
-        # Standard clean map to return names and confidence scores
+        # Map FAISS search output indices to names and confidence scores
         results = [(self.names[idx], float(score)) for score, idx in zip(D[0], I[0]) if idx != -1]
         
         return results

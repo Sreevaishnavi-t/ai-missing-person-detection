@@ -30,18 +30,29 @@ from backend.logger import log_match
 DETECT_EVERY_N = 3
 
 
-def run_detection(source, stop_event=None, frame_callback=None, stop_on_match=False) -> None:
+def run_detection(
+    source,
+    stop_event=None,
+    frame_callback=None,
+    stop_on_match=False,
+    confidence_threshold: float = 0.45,
+    detect_every_n: int = 3,
+    auto_screenshot: bool = True,
+    min_face_size: int = 40
+) -> None:
     """
     Main frame loop: reads video, skips frames for performance, detects faces,
     runs FAISS matching, logs matches, and streams annotated frames.
 
     Args:
-        source:         cv2.VideoCapture source — integer (webcam index) or
-                        string (video file path / RTSP URL).
-        stop_event:     threading.Event polled each frame; set it to stop cleanly.
-        frame_callback: callable(frame: np.ndarray) — called with every annotated
-                        frame so the /stream endpoint can serve it.
-        stop_on_match:  If True, triggers stop_event and exits after finding a match.
+        source:               cv2.VideoCapture source (0, 1, file path, RTSP URL).
+        stop_event:           threading.Event polled each frame to stop cleanly.
+        frame_callback:       callable(frame) called with each annotated frame.
+        stop_on_match:        If True, stops detection after finding a match.
+        confidence_threshold: Minimum similarity score required to trigger match.
+        detect_every_n:       Frame skip count for face detection.
+        auto_screenshot:      If True, saves frame snapshot to data/screenshots/.
+        min_face_size:        Minimum face width/height in pixels for quality gate.
     """
 
     # ── 1. Load FAISS watchlist ───────────────────────────────────────────────
@@ -62,34 +73,27 @@ def run_detection(source, stop_event=None, frame_callback=None, stop_on_match=Fa
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f"[Detector] ERROR: Could not open video source: {source!r}")
-        print("[Detector] Possible causes:")
-        print("  • Webcam index wrong — try 0 or 1")
-        print("  • Video file path has a typo or the file doesn't exist")
-        print("  • File path contains special characters — try copying the exact path")
         return
 
-    # Read actual FPS from the source for informational logging
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    print(f"[Detector] Source FPS: {fps:.1f}  |  Detecting every {DETECT_EVERY_N} frames "
-          f"(~{fps / DETECT_EVERY_N:.1f} detections/sec)")
+    print(f"[Detector] Source FPS: {fps:.1f}  |  Detecting every {detect_every_n} frames "
+          f"(~{fps / max(detect_every_n, 1):.1f} detections/sec) | Threshold: {confidence_threshold:.2f}")
 
     # ── 3. Detection loop ─────────────────────────────────────────────────────
     last_logged:  dict[str, float] = {}
     COOLDOWN_SECONDS = 10.0
     frame_index = 0
-    # Keep the last detected faces so we can draw boxes on skipped frames too
-    last_faces: list = []
+    # Store tuples of (face_bbox, label_str)
+    last_annotations: list[tuple[any, str]] = []
 
     print("[Detector] Loop started. Send POST /stop to exit.")
 
     try:
         while True:
-            # ── Stop signal check ─────────────────────────────────────────────
             if stop_event is not None and stop_event.is_set():
                 print("[Detector] Stop signal received.")
                 break
 
-            # ── Read frame ────────────────────────────────────────────────────
             ret, frame = cap.read()
             if not ret:
                 print("[Detector] End of stream / failed to read frame.")
@@ -98,68 +102,76 @@ def run_detection(source, stop_event=None, frame_callback=None, stop_on_match=Fa
             frame_index += 1
 
             # ── Face detection (every Nth frame only) ─────────────────────────
-            if frame_index % DETECT_EVERY_N == 0:
+            if frame_index % detect_every_n == 0:
                 last_faces = detect_faces(frame)
+                new_annotations = []
 
                 for face in last_faces:
-                    # Extract embedding — skip if fallback mode (no InsightFace)
                     try:
+                        x1, y1, x2, y2 = face.bbox.astype(int)
+                        w, h = x2 - x1, y2 - y1
+                        # Quality gate: drop tiny/blurry faces
+                        if w < min_face_size or h < min_face_size:
+                            continue
+
                         embedding = get_embedding(face)
-                    except RuntimeError:
+                        results = store.search(embedding, top_k=1)
+                        label = ""
+
+                        if results:
+                            person_name, confidence = results[0]
+                            if confidence >= confidence_threshold:
+                                label = f"{person_name} ({confidence:.0%})"
+
+                                now = time.time()
+                                if person_name not in last_logged or (now - last_logged[person_name]) >= COOLDOWN_SECONDS:
+                                    last_logged[person_name] = now
+
+                                    screenshot_path_str = None
+                                    if auto_screenshot:
+                                        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                        safe_name = person_name.replace(" ", "_").replace("/", "_")
+                                        shot_path = SCREENSHOT_DIR / f"{safe_name}_{ts}.jpg"
+                                        cv2.imwrite(str(shot_path), frame)
+                                        screenshot_path_str = str(shot_path)
+
+                                    log_match(
+                                        person_name=person_name,
+                                        confidence=confidence,
+                                        screenshot_path=screenshot_path_str,
+                                        video_source=str(source),
+                                    )
+
+                                    print(f"\n[ALERT] MATCH: {person_name}  |  confidence={confidence:.4f}\n")
+
+                                    if stop_on_match and stop_event is not None:
+                                        print("[Detector] Stop on match triggered. Stopping...")
+                                        stop_event.set()
+
+                        new_annotations.append((face.bbox.astype(int), label))
+                    except Exception as e:
+                        print(f"[Detector] Face process error: {e}")
                         continue
 
-                    # FAISS similarity search
-                    results = store.search(embedding, top_k=1)
-                    if not results:
-                        continue
+                last_annotations = new_annotations
 
-                    person_name, confidence = results[0]
-
-                    if confidence < CONFIDENCE_THRESHOLD:
-                        continue
-
-                    # ── Cooldown check ────────────────────────────────────────
-                    now = time.time()
-                    if person_name in last_logged and \
-                            (now - last_logged[person_name]) < COOLDOWN_SECONDS:
-                        continue
-
-                    last_logged[person_name] = now
-
-                    # ── Save screenshot ───────────────────────────────────────
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # Sanitise name for filesystem (replace spaces and slashes)
-                    safe_name = person_name.replace(" ", "_").replace("/", "_")
-                    screenshot_path = SCREENSHOT_DIR / f"{safe_name}_{ts}.jpg"
-                    cv2.imwrite(str(screenshot_path), frame)
-
-                    # ── Log to SQLite ─────────────────────────────────────────
-                    log_match(
-                        person_name=person_name,
-                        confidence=confidence,
-                        screenshot_path=str(screenshot_path),
-                        video_source=str(source),
-                    )
-
-                    print(f"\n[ALERT] MATCH: {person_name}  |  "
-                          f"confidence={confidence:.4f}  |  {screenshot_path.name}\n")
-
-                    if stop_on_match and stop_event is not None:
-                        print("[Detector] Stop on match triggered. Stopping...")
-                        stop_event.set()
-                        break
-
-            # ── Draw bounding boxes on all detected faces ─────────────────────
-            for face in last_faces:
+            # ── Draw bounding boxes and text labels ───────────────────────────
+            for (x1, y1, x2, y2), label in last_annotations:
                 try:
-                    x1, y1, x2, y2 = face.bbox.astype(int)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    # Optionally label the box — would need to track which face
-                    # matched which name, left simple for now
+                    if label:
+                        cv2.putText(
+                            frame,
+                            label,
+                            (x1, max(y1 - 10, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 0),
+                            2
+                        )
                 except Exception:
                     pass
 
-            # ── Push frame to stream ──────────────────────────────────────────
             if frame_callback is not None:
                 try:
                     frame_callback(frame)

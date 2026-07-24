@@ -17,7 +17,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from contextlib import asynccontextmanager
@@ -28,6 +28,22 @@ from backend.faiss_store import FAISSStore
 from backend.detector import run_detection
 from backend.logger import get_recent_matches, delete_all_matches, update_match_status
 from pydantic import BaseModel
+
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB limit
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+API_KEY = os.getenv("API_KEY", "")
+
+def verify_api_key(x_api_key: str | None = Header(None)):
+    """Validates X-API-Key header if API_KEY environment variable is configured."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key header (X-API-Key).")
+
+class StartRequest(BaseModel):
+    source: int | str = 0
+    stop_on_match: bool = False
+    confidence_threshold: float = 0.45
+    detect_every_n: int = 3
+    auto_screenshot: bool = True
 
 # ==============================================================================
 # METADATA FILE
@@ -188,8 +204,8 @@ app.state.faiss_store = _startup_store
 # ==============================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Restrict to frontend domain in production
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True if "*" not in ALLOWED_ORIGINS else False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -198,29 +214,7 @@ app.add_middleware(
 # ==============================================================================
 # ENDPOINT 1 — POST /enroll
 # ==============================================================================
-# Design decisions:
-#
-# • multipart/form-data (UploadFile + Form) is the correct HTTP mechanism for
-#   sending binary file data alongside text fields.  JSON cannot encode raw
-#   binary, so we use multipart here.
-#
-# • We save the image to data/watchlist/ using the enrolled name so operators
-#   can manually inspect or remove reference photos.
-#
-# • We only allow exactly one face per enrollment photo.  Zero faces means the
-#   photo is unusable; multiple faces mean we cannot determine which person to
-#   enroll, leading to the wrong embedding being stored.
-#
-# • After adding to the in-memory FAISSStore we immediately call save_index()
-#   so the data survives a server restart.
-#
-# • We use a plain `def` (not `async def`) because all work here is CPU-bound
-#   (image decoding, neural network inference, FAISS write).  FastAPI
-#   automatically runs sync endpoints in a thread-pool executor, keeping the
-#   async event loop unblocked.  See the bottom of the file for a full
-#   async vs sync explanation.
-# ==============================================================================
-@app.post("/enroll")
+@app.post("/enroll", dependencies=[Depends(verify_api_key)])
 def enroll_person(
     file: UploadFile = File(..., description="JPEG/PNG reference photo of the person"),
     name: str = Form(..., description="Full name of the missing person"),
@@ -229,6 +223,12 @@ def enroll_person(
 
     # ── 1. Read raw bytes and decode to BGR numpy array ──────────────────────
     image_bytes = file.file.read()
+    if len(image_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="File size exceeds maximum allowed limit of 10MB.",
+        )
+
     image_array = np.frombuffer(image_bytes, dtype=np.uint8)
     image_bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
@@ -327,7 +327,7 @@ def get_watchlist():
 #      image file and re-extracting embeddings.
 #   4. Save the rebuilt index and updated metadata to disk.
 # ==============================================================================
-@app.delete("/watchlist/{person_id}")
+@app.delete("/watchlist/{person_id}", dependencies=[Depends(verify_api_key)])
 def delete_from_watchlist(person_id: int):
     """Remove an enrolled person from the watchlist by ID."""
     metadata = _load_metadata()
@@ -387,66 +387,125 @@ def delete_from_watchlist(person_id: int):
     return {"status": "deleted", "id": person_id}
 
 
+@app.post("/watchlist/{person_id}/photos", dependencies=[Depends(verify_api_key)])
+def add_person_photo(
+    person_id: int,
+    file: UploadFile = File(..., description="Additional JPEG/PNG reference photo"),
+):
+    """Add a secondary reference photo for an existing enrolled person."""
+    metadata = _load_metadata()
+    person = next((p for p in metadata if p["id"] == person_id), None)
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person with ID {person_id} not found.")
+
+    image_bytes = file.file.read()
+    if len(image_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File size exceeds maximum allowed limit of 10MB.")
+
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image_bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
+    faces = detect_faces(image_bgr)
+    if len(faces) != 1:
+        raise HTTPException(status_code=400, detail="Photo must contain exactly one face.")
+
+    emb = get_embedding(faces[0])
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = person["name"].replace(" ", "_")
+    photo_path = WATCHLIST_DIR / f"{safe_name}_extra_{ts}.jpg"
+    cv2.imwrite(str(photo_path), image_bgr)
+
+    store = app.state.faiss_store or FAISSStore()
+    store.add(person["name"], emb)
+    store.save_index(str(DB_PATH))
+
+    return {"status": "added", "person_name": person["name"], "photo_path": str(photo_path)}
+
+
+@app.post("/rebuild-index", dependencies=[Depends(verify_api_key)])
+def rebuild_index():
+    """Rebuild the FAISS index by re-scanning data/watchlist/ photos."""
+    if app.state.detection_thread is not None and app.state.detection_thread.is_alive():
+        raise HTTPException(status_code=409, detail="Stop detection before rebuilding the FAISS index.")
+
+    store = app.state.faiss_store or FAISSStore()
+    metadata = _load_metadata()
+    store.index.reset()
+    store.names.clear()
+
+    count = 0
+    for e in metadata:
+        safe_name = e["name"].replace(" ", "_")
+        candidates = (
+            list(WATCHLIST_DIR.glob(f"{safe_name}_*.jpg")) +
+            list(WATCHLIST_DIR.glob(f"{safe_name}_*.jpeg")) +
+            list(WATCHLIST_DIR.glob(f"{safe_name}_*.png")) +
+            list(WATCHLIST_DIR.glob(f"{safe_name}_*.webp"))
+        )
+        if not candidates:
+            continue
+        for img_path in candidates:
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is None:
+                continue
+            faces = detect_faces(img_bgr)
+            if not faces:
+                continue
+            try:
+                emb = get_embedding(faces[0])
+                store.add(e["name"], emb)
+                count += 1
+            except Exception:
+                pass
+
+    if store.index.ntotal > 0:
+        store.save_index(str(DB_PATH))
+    app.state.faiss_store = store
+    return {"status": "rebuilt", "enrolled_faces": count, "message": f"FAISS index rebuilt with {count} face embedding(s)."}
+
+
 # ==============================================================================
 # ENDPOINT 3 — POST /start
 # ==============================================================================
-# Design decisions:
-#
-# • Detection is started in a daemon background thread.  See the bottom of the
-#   file for a full explanation of why we cannot run it on the main thread.
-#
-# • We use threading.Event as a cooperative stop signal.  The detection loop
-#   in detector.py polls stop_event.is_set() on every frame, so it exits
-#   cleanly and releases the camera handle rather than being killed abruptly.
-#
-# • The frame_callback closure captures app.state and updates latest_frame
-#   under a lock so the /stream endpoint can safely read the latest frame from
-#   a different thread.
-#
-# • We guard against double-starts: if a thread is already alive we return 409.
-# ==============================================================================
-@app.post("/start")
-def start_detection(body: dict):
+@app.post("/start", dependencies=[Depends(verify_api_key)])
+def start_detection(body: StartRequest):
     """
     Start the background detection loop.
-
-    Body: `{ "source": 0 }` for webcam or `{ "source": "path/to/video.mp4" }`.
     """
-    source_raw = body.get("source", 0)
+    source_raw = body.source
 
-    # Convert numeric strings ("0", "1") to integers so cv2.VideoCapture
-    # opens the correct webcam index rather than treating it as a file path.
     if isinstance(source_raw, str) and source_raw.isdigit():
         source = int(source_raw)
     else:
         source = source_raw
 
-    # Guard: reject if detection is already running
     if (
         app.state.detection_thread is not None
         and app.state.detection_thread.is_alive()
     ):
         raise HTTPException(status_code=409, detail="Detection is already running.")
 
-    stop_on_match = body.get("stop_on_match", False)
-
-    # Create a fresh stop event for this run
     stop_event = threading.Event()
     app.state.stop_event = stop_event
 
-    # Frame callback: called by detector.py for every processed frame.
-    # It stores the latest annotated frame so /stream can serve it.
     def _frame_callback(frame: np.ndarray):
         with app.state.frame_lock:
             app.state.latest_frame = frame.copy()
 
-    # Spin up the background thread.
-    # daemon=True means the thread is killed automatically if the process exits,
-    # preventing the server from hanging on Ctrl-C.
     thread = threading.Thread(
         target=run_detection,
         args=(source,),
-        kwargs={"stop_event": stop_event, "frame_callback": _frame_callback, "stop_on_match": stop_on_match},
+        kwargs={
+            "stop_event": stop_event,
+            "frame_callback": _frame_callback,
+            "stop_on_match": body.stop_on_match,
+            "confidence_threshold": body.confidence_threshold,
+            "detect_every_n": body.detect_every_n,
+            "auto_screenshot": body.auto_screenshot,
+        },
         daemon=True,
         name="DetectionThread",
     )
@@ -463,7 +522,7 @@ def start_detection(body: dict):
 # finish releasing the camera.  We use a timeout so the API call doesn't hang
 # forever if the thread is stuck (e.g., waiting on a network stream).
 # ==============================================================================
-@app.post("/stop")
+@app.post("/stop", dependencies=[Depends(verify_api_key)])
 def stop_detection():
     """Signal the detection thread to stop and wait for it to finish."""
     if app.state.stop_event is None or app.state.detection_thread is None:
@@ -475,8 +534,6 @@ def stop_detection():
     app.state.detection_thread = None
     app.state.stop_event = None
 
-    # Clear the latest frame so /stream shows a black placeholder again
-    # instead of the last frozen frame from the stopped session.
     with app.state.frame_lock:
         app.state.latest_frame = None
 
@@ -492,31 +549,23 @@ def get_status():
     return {"is_running": is_running}
 
 
-# ==============================================================================
-# ENDPOINT 5 — GET /results
-# ==============================================================================
-# Thin wrapper around logger.get_recent_matches().
-#
-# We augment each result with a screenshot_url — the URL path the browser or
-# test can use to fetch the image via the /screenshots endpoint below.
-# We keep screenshot_path (the original filesystem path) in the response too
-# because the test checks both fields.
-# ==============================================================================
 @app.get("/results")
 def get_results(limit: int = 50):
     """Return the most recent detection matches, newest first."""
     matches = get_recent_matches(limit=limit)
 
     for match in matches:
-        # Build a URL-safe filename from the stored absolute path
         raw_path = match.get("screenshot_path", "")
-        filename = Path(raw_path).name
-        match["screenshot_url"] = f"/screenshots/{filename}"
+        if raw_path:
+            filename = Path(raw_path).name
+            match["screenshot_url"] = f"/screenshots/{filename}"
+        else:
+            match["screenshot_url"] = None
 
     return matches
 
 
-@app.delete("/results/all")
+@app.delete("/results/all", dependencies=[Depends(verify_api_key)])
 def clear_all_results():
     """Delete every match record from the SQLite database."""
     count = delete_all_matches()
@@ -526,7 +575,7 @@ def clear_all_results():
 class StatusUpdate(BaseModel):
     status: str
 
-@app.patch("/results/{match_id}")
+@app.patch("/results/{match_id}", dependencies=[Depends(verify_api_key)])
 def update_result_status(match_id: int, payload: StatusUpdate):
     """Updates the status of a specific match (e.g. pending -> approved)."""
     valid_statuses = ["pending", "approved", "rejected"]
